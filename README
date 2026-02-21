@@ -1,0 +1,32 @@
+CSE 363 HW1 - Argus Skeleton
+
+Files
+- argus.py: starter implementation skeleton for HTTP/TLS/DNS request sniffing.
+- README: this file.
+
+Environment (Kali Linux 2025.4)
+- sudo apt update
+- sudo apt install -y python3-scapy python3-cryptography tcpdump wireshark
+
+Usage
+- Offline trace:
+  ./argus.py -r test.pcap
+
+- Live capture (default interface if -i omitted):
+  sudo ./argus.py -i eth0
+
+- With BPF expression:
+  sudo ./argus.py -i eth0 host 192.168.0.123
+
+Current coverage in this skeleton
+- Argument parsing for -i, -r, and optional BPF expression.
+- Per-packet parsing hooks for:
+  - DNS A requests (+ INTERNAL tld tag)
+  - HTTP GET/POST/PUT requests (+ automation User-Agent tag)
+  - TLS ClientHello SNI extraction (+ NO SNI fallback)
+- Output prefix formatter: timestamp + src/dst IP:port.
+
+Notes
+- No IP defragmentation or TCP reassembly is implemented (per HW requirement).
+- Protocol detection is packet-content based, not fixed destination port based.
+- You should still validate with your own test.pcap and tune edge cases.
