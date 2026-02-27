@@ -8,10 +8,18 @@ import sys
 from datetime import datetime
 from typing import Optional, Tuple
 
-from scapy.all import DNS, DNSQR, IP, Raw, TCP, UDP, load_layer, sniff
+from scapy.all import DNS, DNSQR, IP, Raw, TCP, UDP, conf, load_layer, sniff
 
 AUTOMATION_RE = re.compile(r"(curl|wget|python|requests|urllib|httpx)", re.IGNORECASE)
 INTERNAL_TLDS = (".local", ".corp", ".internal")
+DEBUG = False
+NO_MATCH_DEBUG_LIMIT = 25
+_no_match_debug_count = 0
+
+
+def debug_log(message: str) -> None:
+    if DEBUG:
+        print(f"[debug] {message}", file=sys.stderr, flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,8 +35,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "expression",
-        nargs=argparse.REMAINDER,
+        nargs="*",
         help="Optional BPF filter expression (example: host 192.168.0.123).",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable packet-level debug logs on stderr.",
     )
     args = parser.parse_args()
     args.expression = " ".join(args.expression).strip()
@@ -82,26 +95,39 @@ def decode_bytes(raw: bytes) -> str:
     return raw.decode("utf-8", errors="ignore")
 
 
+def get_tcp_payload(packet) -> bytes:
+    if TCP not in packet:
+        return b""
+    try:
+        payload = bytes(packet[TCP].payload)
+    except Exception:
+        return b""
+    return payload if payload else b""
+
+
 def parse_http_request(packet) -> Optional[str]:
-    if TCP not in packet or Raw not in packet:
+    if TCP not in packet:
         return None
 
-    payload = bytes(packet[Raw].load)
+    payload = get_tcp_payload(packet)
     if not payload:
         return None
 
     header_block = decode_bytes(payload)
-    lines = header_block.split("\r\n")
+    lines = header_block.splitlines()
     if not lines:
         return None
 
     request_line = lines[0].strip()
     parts = request_line.split()
-    if len(parts) < 2:
+    if len(parts) < 3:
         return None
 
     method = parts[0].upper()
+    version = parts[2].upper()
     if method not in {"GET", "POST", "PUT"}:
+        return None
+    if not version.startswith("HTTP/"):
         return None
 
     uri = parts[1]
@@ -127,22 +153,56 @@ def parse_http_request(packet) -> Optional[str]:
     return output
 
 
+def get_dns_layer(packet) -> Optional[DNS]:
+    # Keep DNS detection independent from destination port number.
+    if DNS in packet:
+        return packet[DNS]
+
+    if UDP in packet and Raw in packet:
+        try:
+            return DNS(bytes(packet[Raw].load))
+        except Exception:
+            return None
+
+    return None
+
+
 def parse_dns_query(packet) -> Optional[str]:
-    if UDP not in packet or DNS not in packet:
+    if UDP not in packet:
         return None
 
-    dns = packet[DNS]
+    dns = get_dns_layer(packet)
+    if dns is None:
+        return None
+
     if int(dns.qr) != 0:
         return None
-    if int(dns.qdcount) < 1 or not isinstance(dns.qd, DNSQR):
+    if int(dns.qdcount) < 1:
         return None
 
     qd = dns.qd
-    qtype = int(qd.qtype)
+    if isinstance(qd, DNSQR):
+        first_qd = qd
+    else:
+        try:
+            first_qd = qd[0]
+        except Exception:
+            return None
+
+    if not isinstance(first_qd, DNSQR):
+        return None
+
+    qtype = int(first_qd.qtype)
     if qtype != 1:
         return None
 
-    name = bytes(qd.qname).decode("utf-8", errors="ignore").rstrip(".")
+    qname = first_qd.qname
+    if isinstance(qname, bytes):
+        name = qname.decode("utf-8", errors="ignore")
+    else:
+        name = str(qname)
+    name = name.rstrip(".")
+
     if not name:
         return None
 
@@ -247,10 +307,10 @@ def parse_sni_from_client_hello_body(body: bytes) -> str:
 
 
 def parse_tls_client_hello(packet) -> Optional[str]:
-    if TCP not in packet or Raw not in packet:
+    if TCP not in packet:
         return None
 
-    payload = bytes(packet[Raw].load)
+    payload = get_tcp_payload(packet)
     if not payload:
         return None
 
@@ -266,14 +326,22 @@ def parse_tls_client_hello(packet) -> Optional[str]:
 
 
 def handle_packet(packet) -> None:
+    global _no_match_debug_count
+
     for parser in (parse_dns_query, parse_http_request, parse_tls_client_hello):
         output = parser(packet)
         if output:
-            print(output)
+            print(output, flush=True)
             return
+
+    if DEBUG and _no_match_debug_count < NO_MATCH_DEBUG_LIMIT:
+        _no_match_debug_count += 1
+        debug_log(f"no match: {packet.summary()}")
 
 
 def run_live_capture(interface: Optional[str], bpf_filter: str) -> None:
+    iface_name = interface if interface else str(conf.iface)
+    debug_log(f"live capture interface={iface_name} bpf={bpf_filter or '<none>'}")
     sniff(
         iface=interface if interface else None,
         filter=bpf_filter if bpf_filter else None,
@@ -283,6 +351,7 @@ def run_live_capture(interface: Optional[str], bpf_filter: str) -> None:
 
 
 def run_trace_capture(tracefile: str, bpf_filter: str) -> None:
+    debug_log(f"offline capture tracefile={tracefile} bpf={bpf_filter or '<none>'}")
     sniff(
         offline=tracefile,
         filter=bpf_filter if bpf_filter else None,
@@ -292,8 +361,11 @@ def run_trace_capture(tracefile: str, bpf_filter: str) -> None:
 
 
 def main() -> int:
+    global DEBUG
+
     load_optional_layers()
     args = parse_args()
+    DEBUG = bool(args.debug)
 
     def _stop_signal_handler(signum, frame):
         raise KeyboardInterrupt
@@ -312,6 +384,9 @@ def main() -> int:
         return 1
     except FileNotFoundError as exc:
         print(f"Input file not found: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"Unexpected error: {exc}", file=sys.stderr)
         return 1
 
     return 0

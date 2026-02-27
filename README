@@ -30,3 +30,8 @@ Notes
 - No IP defragmentation or TCP reassembly is implemented (per HW requirement).
 - Protocol detection is packet-content based, not fixed destination port based.
 - You should still validate with your own test.pcap and tune edge cases.
+Legal Notice
+- This project is for educational and authorized testing purposes only.
+- Do not use this tool on networks, systems, or traffic you do not own or have explicit permission to test.
+- Any misuse or illegal use is solely the responsibility of the user.
+- The author/distributor assumes no liability for damages, losses, or legal issues resulting from use of this tool.
